@@ -1,5 +1,5 @@
 
-import { TradingConfig } from './types';
+import { TradingConfig, ExchangeProvider } from './types';
 
 export const DEFAULT_CONFIG: TradingConfig = {
   initialCapital: 100,
@@ -18,6 +18,15 @@ export const DEFAULT_CONFIG: TradingConfig = {
   pollingIntervalMs: 1000,
   useDynamicDcaLevels: false,
   dcaLevelsEquityPercent: 20,
+  // Exchange Defaults
+  exchange: ExchangeProvider.SIMULATED,
+  isLiveMode: false,
+  credentials: {
+    apiKey: '',
+    apiSecret: '',
+  },
+  // Added missing required property
+  emergencyStop: false
 };
 
 export const SYMBOLS = [

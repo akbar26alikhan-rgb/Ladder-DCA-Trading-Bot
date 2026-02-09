@@ -1,26 +1,54 @@
 
-import { BotState, TradingConfig, Position, PositionStatus, MarketTick } from '../types';
+import { 
+  BotState, TradingConfig, Position, PositionStatus, 
+  ExchangeProvider, TradeLog 
+} from '../types';
+import { ExchangeAdapter, getExchangeAdapter } from './exchangeAdapters';
 
 export class TradingEngine {
   private config: TradingConfig;
   private state: BotState;
+  private adapter: ExchangeAdapter;
 
   constructor(config: TradingConfig) {
     this.config = config;
-    this.state = {
-      balance: config.initialCapital,
-      positions: [],
-      history: [],
-      currentPrice: 0,
-      peakEquity: config.initialCapital,
-      realizedPnl: 0,
-      isPaused: false,
-      effectiveMaxLevels: config.maxDcaLevels,
-    };
+    this.adapter = getExchangeAdapter(config.exchange);
+    
+    // Load state from local storage or initialize
+    const saved = localStorage.getItem(`bot_state_${config.symbol}`);
+    if (saved) {
+      this.state = JSON.parse(saved);
+      // Ensure UI state like price starts fresh
+      this.state.currentPrice = 0;
+    } else {
+      this.state = {
+        balance: config.initialCapital,
+        positions: [],
+        history: [],
+        logs: [],
+        currentPrice: 0,
+        peakEquity: config.initialCapital,
+        realizedPnl: 0,
+        isPaused: true,
+        effectiveMaxLevels: config.maxDcaLevels,
+        isConnected: config.exchange === ExchangeProvider.SIMULATED,
+        dailyLoss: 0,
+      };
+    }
   }
 
-  public updateConfig(newConfig: TradingConfig) {
+  public async updateConfig(newConfig: TradingConfig) {
     this.config = newConfig;
+    if (this.config.exchange !== this.adapter.name) {
+      this.adapter = getExchangeAdapter(this.config.exchange);
+    }
+    
+    if (this.config.exchange !== ExchangeProvider.SIMULATED) {
+      this.state.isConnected = await this.adapter.authenticate(this.config.credentials);
+    } else {
+      this.state.isConnected = true;
+    }
+    this.save();
   }
 
   public getState(): BotState {
@@ -29,42 +57,51 @@ export class TradingEngine {
 
   public setPaused(paused: boolean) {
     this.state.isPaused = paused;
+    this.addLog('SYSTEM', 0, 0, 0, `Bot ${paused ? 'Paused' : 'Resumed'}`);
+    this.save();
   }
 
-  public tick(price: number): BotState {
-    if (this.state.isPaused) return this.state;
+  public async tick(price: number): Promise<BotState> {
+    if (this.state.isPaused || this.config.emergencyStop) return this.state;
     
+    if (this.config.isLiveMode && !this.state.isConnected) {
+      this.state.isPaused = true;
+      this.addLog('ERROR', 0, 0, 0, 'Live mode connection lost. Bot paused.');
+      return this.state;
+    }
+
     this.state.currentPrice = price;
     const currentEquity = this.calculateEquity();
     
-    // Update Effective Max Levels
+    // Max Levels Calculation
     if (this.config.useDynamicDcaLevels) {
       this.state.effectiveMaxLevels = Math.max(1, Math.floor(currentEquity * (this.config.dcaLevelsEquityPercent / 100)));
     } else {
       this.state.effectiveMaxLevels = this.config.maxDcaLevels;
     }
 
-    // Update Peak Equity for Drawdown calculation
-    if (currentEquity > this.state.peakEquity) {
-      this.state.peakEquity = currentEquity;
-    }
-
-    // Check Global Drawdown
+    // Risk: Peak Equity & Global Drawdown
+    if (currentEquity > this.state.peakEquity) this.state.peakEquity = currentEquity;
     if (this.config.enableGlobalDrawdown) {
       const drawdown = (this.state.peakEquity - currentEquity) / this.state.peakEquity;
       if (drawdown >= this.config.maxDrawdownPercent / 100) {
-        this.closeAllPositions("GLOBAL_DRAWDOWN_TRIGGERED");
+        await this.closeAllPositions("GLOBAL_DRAWDOWN_TRIGGERED");
         this.state.isPaused = true;
         return this.state;
       }
     }
 
-    // Step 1: Handle Exits (FIFO)
-    this.processExits(price);
+    // Risk: Daily Loss
+    if (this.config.maxDailyLossLimit && this.state.dailyLoss >= this.config.maxDailyLossLimit) {
+      await this.closeAllPositions("DAILY_LOSS_LIMIT_REACHED");
+      this.state.isPaused = true;
+      return this.state;
+    }
 
-    // Step 2: Handle Entries (DCA)
-    this.processEntries(price);
+    await this.processExits(price);
+    await this.processEntries(price);
 
+    this.save();
     return this.state;
   }
 
@@ -73,104 +110,123 @@ export class TradingEngine {
     return this.state.balance + openValue;
   }
 
-  private processExits(price: number) {
-    // Sort by entry time for strict FIFO
+  private async processExits(price: number) {
+    // FIFO Rule: Oldest positions first (sorted by entryTime)
     const openPositions = [...this.state.positions].sort((a, b) => a.entryTime - b.entryTime);
-    
     const remainingPositions: Position[] = [];
 
     for (const pos of openPositions) {
       let shouldClose = false;
-
-      // Check Take Profit
-      if (price >= pos.tpPrice) {
-        shouldClose = true;
-      }
-
-      // Check Stop Loss
-      if (this.config.enableStopLoss && pos.slPrice && price <= pos.slPrice) {
-        shouldClose = true;
-      }
+      if (price >= pos.tpPrice) shouldClose = true;
+      if (this.config.enableStopLoss && pos.slPrice && price <= pos.slPrice) shouldClose = true;
 
       if (shouldClose) {
-        this.executeSell(pos, price);
+        await this.executeSell(pos, price);
       } else {
         remainingPositions.push(pos);
       }
     }
-
     this.state.positions = remainingPositions;
   }
 
-  private processEntries(price: number) {
+  private async processEntries(price: number) {
     if (!this.config.enableDca) return;
-    
-    // Use effectiveMaxLevels which is either static or dynamic
     if (this.state.positions.length >= this.state.effectiveMaxLevels) return;
 
     let shouldBuy = false;
-
     if (this.state.positions.length === 0) {
-      // Initial Entry
       shouldBuy = true;
     } else {
-      // Find the most recent buy
       const lastBuy = this.state.positions.reduce((latest, curr) => 
         curr.entryTime > latest.entryTime ? curr : latest
       , this.state.positions[0]);
 
       const dipThreshold = lastBuy.entryPrice * (1 - (this.config.dipTriggerPercent / 100));
-      if (price <= dipThreshold) {
-        shouldBuy = true;
-      }
+      if (price <= dipThreshold) shouldBuy = true;
     }
 
     if (shouldBuy) {
       const orderAmount = this.state.balance * this.config.allocationRate;
+      const minNotional = await this.adapter.getMinNotional(this.config.symbol);
       
-      if (orderAmount >= this.config.minNotional && this.state.balance >= orderAmount) {
-        this.executeBuy(price, orderAmount);
+      if (orderAmount >= minNotional && this.state.balance >= orderAmount) {
+        await this.executeBuy(price, orderAmount);
+      } else if (orderAmount < minNotional) {
+        this.addLog('SKIP', price, 0, orderAmount, `Order below min notional (${minNotional})`);
       }
     }
   }
 
-  private executeBuy(price: number, amount: number) {
-    const quantity = amount / price;
-    const newPosition: Position = {
-      id: crypto.randomUUID(),
-      entryTime: Date.now(),
-      entryPrice: price,
-      quantity: quantity,
-      usdInvested: amount,
-      status: PositionStatus.OPEN,
-      tpPrice: price * (1 + this.config.takeProfitPercent / 100),
-      slPrice: this.config.enableStopLoss ? price * (1 - this.config.stopLossPercent / 100) : undefined,
-    };
-
-    this.state.balance -= amount;
-    this.state.positions.push(newPosition);
+  private async executeBuy(price: number, amount: number) {
+    try {
+      const result = await this.adapter.placeMarketBuy(this.config.symbol, amount, price);
+      const newPosition: Position = {
+        id: result.id,
+        user_id: 'user_1',
+        exchange_account_id: this.config.exchange,
+        symbol: this.config.symbol,
+        entryTime: Date.now(),
+        entryPrice: result.price,
+        quantity: result.quantity,
+        usdInvested: amount,
+        status: PositionStatus.OPEN,
+        tpPrice: result.price * (1 + this.config.takeProfitPercent / 100),
+        slPrice: this.config.enableStopLoss ? result.price * (1 - this.config.stopLossPercent / 100) : undefined,
+      };
+      this.state.balance -= amount;
+      this.state.positions.push(newPosition);
+      this.addLog('BUY', result.price, result.quantity, amount, 'DCA Buy Executed');
+    } catch (e: any) {
+      this.addLog('ERROR', price, 0, amount, `Buy failed: ${e.message}`);
+    }
   }
 
-  private executeSell(pos: Position, price: number) {
-    const revenue = pos.quantity * price;
-    const pnl = revenue - pos.usdInvested;
-
-    const closedPos: Position = {
-      ...pos,
-      status: PositionStatus.CLOSED,
-      exitTime: Date.now(),
-      exitPrice: price,
-      pnlUsd: pnl,
-    };
-
-    this.state.balance += revenue;
-    this.state.realizedPnl += pnl;
-    this.state.history.unshift(closedPos); // Keep latest at top
+  private async executeSell(pos: Position, price: number) {
+    try {
+      const result = await this.adapter.placeMarketSell(this.config.symbol, pos.quantity, price);
+      const pnl = result.revenue - pos.usdInvested;
+      const closedPos: Position = {
+        ...pos,
+        status: PositionStatus.CLOSED,
+        exitTime: Date.now(),
+        exitPrice: result.price,
+        pnlUsd: pnl,
+      };
+      this.state.balance += result.revenue;
+      this.state.realizedPnl += pnl;
+      if (pnl < 0) this.state.dailyLoss += Math.abs(pnl);
+      this.state.history.unshift(closedPos);
+      this.addLog('SELL', result.price, pos.quantity, result.revenue, `Position Closed (PnL: $${pnl.toFixed(2)})`);
+    } catch (e: any) {
+      this.addLog('ERROR', price, pos.quantity, 0, `Sell failed: ${e.message}`);
+    }
   }
 
-  private closeAllPositions(reason: string) {
-    this.state.positions.forEach(pos => this.executeSell(pos, this.state.currentPrice));
+  public async closeAllPositions(reason: string) {
+    this.addLog('SYSTEM', 0, 0, 0, `Emergency Closure: ${reason}`);
+    for (const pos of this.state.positions) {
+      await this.executeSell(pos, this.state.currentPrice);
+    }
     this.state.positions = [];
-    console.log(`Closing all positions: ${reason}`);
+    this.save();
+  }
+
+  private addLog(action: TradeLog['action'], price: number, quantity: number, amount: number, message: string) {
+    const log: TradeLog = {
+      id: crypto.randomUUID(),
+      timestamp: Date.now(),
+      symbol: this.config.symbol,
+      action,
+      price,
+      quantity,
+      amount,
+      message
+    };
+    this.state.logs.unshift(log);
+    if (this.state.logs.length > 200) this.state.logs.pop();
+  }
+
+  private save() {
+    localStorage.setItem(`bot_state_${this.config.symbol}`, JSON.stringify(this.state));
   }
 }

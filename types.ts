@@ -4,26 +4,57 @@ export enum PositionStatus {
   CLOSED = 'CLOSED'
 }
 
+export enum ExchangeProvider {
+  SIMULATED = 'SIMULATED',
+  BINANCE = 'BINANCE',
+  BYBIT = 'BYBIT',
+  KUCOIN = 'KUCOIN',
+  OKX = 'OKX',
+  COINBASE = 'COINBASE',
+  KRAKEN = 'KRAKEN'
+}
+
+export interface ApiCredentials {
+  apiKey: string;
+  apiSecret: string;
+  passphrase?: string;
+}
+
 export interface Position {
   id: string;
-  entryTime: number;
+  user_id: string;
+  exchange_account_id: string;
+  symbol: string;
   entryPrice: number;
   quantity: number;
   usdInvested: number;
   status: PositionStatus;
   tpPrice: number;
   slPrice?: number;
+  entryTime: number;
   exitTime?: number;
   exitPrice?: number;
   pnlUsd?: number;
 }
 
+export interface TradeLog {
+  id: string;
+  timestamp: number;
+  symbol: string;
+  action: 'BUY' | 'SELL' | 'SKIP' | 'ERROR' | 'SYSTEM';
+  price: number;
+  quantity: number;
+  amount: number;
+  message: string;
+  details?: any;
+}
+
 export interface TradingConfig {
   initialCapital: number;
-  allocationRate: number; // e.g., 0.05
-  dipTriggerPercent: number; // e.g., 2.0
-  takeProfitPercent: number; // e.g., 2.0
-  stopLossPercent: number; // e.g., 5.0
+  allocationRate: number;
+  dipTriggerPercent: number;
+  takeProfitPercent: number;
+  stopLossPercent: number;
   maxDcaLevels: number;
   minNotional: number;
   symbol: string;
@@ -33,20 +64,29 @@ export interface TradingConfig {
   enableGlobalDrawdown: boolean;
   maxDrawdownPercent: number;
   pollingIntervalMs: number;
-  // New dynamic DCA properties
   useDynamicDcaLevels: boolean;
-  dcaLevelsEquityPercent: number; // e.g., 10% of equity = 10 max levels if equity is 100
+  dcaLevelsEquityPercent: number;
+  // Exchange Settings
+  exchange: ExchangeProvider;
+  isLiveMode: boolean;
+  credentials: ApiCredentials;
+  // Safety Controls
+  maxDailyLossLimit?: number;
+  emergencyStop: boolean;
 }
 
 export interface BotState {
   balance: number;
   positions: Position[];
   history: Position[];
+  logs: TradeLog[];
   currentPrice: number;
   peakEquity: number;
   realizedPnl: number;
   isPaused: boolean;
-  effectiveMaxLevels: number; // To track the calculated limit
+  effectiveMaxLevels: number;
+  isConnected: boolean;
+  dailyLoss: number;
 }
 
 export interface MarketTick {
