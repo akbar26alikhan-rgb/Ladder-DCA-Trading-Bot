@@ -1,0 +1,5 @@
+{
+  "name": "Ladder DCA Trading Bot",
+  "description": "A high-performance automated crypto trading dashboard featuring a Ladder DCA strategy with FIFO liquidation and real-time performance tracking.",
+  "requestFramePermissions": []
+}
